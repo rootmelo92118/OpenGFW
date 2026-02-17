@@ -181,7 +181,6 @@ type cliConfigIO struct {
 
 	ReadBuffer  int  `mapstructure:"rcvBuf"`
 	WriteBuffer int  `mapstructure:"sndBuf"`
-	Local       bool `mapstructure:"local"`
 	RST         bool `mapstructure:"rst"`
 	Input       bool `mapstructure:"input"`
 	Output      bool `mapstructure:"output"`
@@ -233,7 +232,6 @@ func (c *cliConfig) fillIO(config *engine.Config) error {
 
 			ReadBuffer:  c.IO.ReadBuffer,
 			WriteBuffer: c.IO.WriteBuffer,
-			Local:       c.IO.Local,
 			RST:         c.IO.RST,
 			EnabledChains: io.EnabledChainsConfig{
 				Input:   c.IO.Input,
