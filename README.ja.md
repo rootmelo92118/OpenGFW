@@ -1,6 +1,6 @@
 # ![OpenGFW](docs/logo.png)
 
-[![Quality check status](https://github.com/apernet/OpenGFW/actions/workflows/check.yaml/badge.svg)](https://github.com/apernet/OpenGFW/actions/workflows/check.yaml)
+[![Quality check status](https://github.com/rootmelo92118/OpenGFW/actions/workflows/check.yaml/badge.svg)](https://github.com/rootmelo92118/OpenGFW/actions/workflows/check.yaml)
 [![License][1]][2]
 
 [1]: https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg
@@ -39,3 +39,8 @@ Telegram グループ: https://t.me/OpGFW
 - VPN/プロキシサービスの不正利用防止
 - トラフィック分析（ログのみモード）
 - 独裁的な野心を実現するのを助ける
+
+## ナーワル (Narwhal)
+
+- オプションリンク（アウトバウンド、インバウンド、フォワード）
+- Docker 対応
