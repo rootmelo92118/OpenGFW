@@ -110,12 +110,23 @@ func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
 			Chain:  entry.chain,
 			Header: chainHeaders[entry.chain],
 		}
-		spec.Rules = append(spec.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
-		spec.Rules = append(spec.Rules, "ct mark $ACCEPT_CTMARK counter accept")
-		if n.rst {
-			spec.Rules = append(spec.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
+		if entry.chain == "OUTPUT" {
+			// On OUTPUT, conntrack may not yet be established for NEW packets.
+			// Restrict mark-based bypass rules to established/related flows only.
+			spec.Rules = append(spec.Rules, "ct state established,related meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
+			spec.Rules = append(spec.Rules, "ct state established,related ct mark $ACCEPT_CTMARK counter accept")
+			if n.rst {
+				spec.Rules = append(spec.Rules, "ct state established,related ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
+			}
+			spec.Rules = append(spec.Rules, "ct state established,related ct mark $DROP_CTMARK counter drop")
+		} else {
+			spec.Rules = append(spec.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
+			spec.Rules = append(spec.Rules, "ct mark $ACCEPT_CTMARK counter accept")
+			if n.rst {
+				spec.Rules = append(spec.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
+			}
+			spec.Rules = append(spec.Rules, "ct mark $DROP_CTMARK counter drop")
 		}
-		spec.Rules = append(spec.Rules, "ct mark $DROP_CTMARK counter drop")
 		spec.Rules = append(spec.Rules, "counter queue num $QUEUE_NUM bypass")
 		table.Chains = append(table.Chains, spec)
 	}
@@ -142,26 +153,54 @@ func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
 	rules := make([]iptRule, 0, 5*len(entries))
 
 	for _, entry := range entries {
-		// Bypass protected connections
-		rules = append(rules, iptRule{"filter", entry.chain, []string{
-			"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept),
-			"-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept),
-		}})
-		rules = append(rules, iptRule{"filter", entry.chain, []string{
-			"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept),
-			"-j", "ACCEPT",
-		}})
-		if n.rst {
+		if entry.chain == "OUTPUT" {
+			// On OUTPUT, conntrack may not yet be established for NEW packets.
+			// Restrict mark-based bypass rules to established/related flows only.
 			rules = append(rules, iptRule{"filter", entry.chain, []string{
-				"-p", "tcp",
+				"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+				"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept),
+				"-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept),
+			}})
+			rules = append(rules, iptRule{"filter", entry.chain, []string{
+				"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+				"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept),
+				"-j", "ACCEPT",
+			}})
+			if n.rst {
+				rules = append(rules, iptRule{"filter", entry.chain, []string{
+					"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+					"-p", "tcp",
+					"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
+					"-j", "REJECT", "--reject-with", "tcp-reset",
+				}})
+			}
+			rules = append(rules, iptRule{"filter", entry.chain, []string{
+				"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
 				"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
-				"-j", "REJECT", "--reject-with", "tcp-reset",
+				"-j", "DROP",
+			}})
+		} else {
+			// Bypass protected connections
+			rules = append(rules, iptRule{"filter", entry.chain, []string{
+				"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept),
+				"-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept),
+			}})
+			rules = append(rules, iptRule{"filter", entry.chain, []string{
+				"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept),
+				"-j", "ACCEPT",
+			}})
+			if n.rst {
+				rules = append(rules, iptRule{"filter", entry.chain, []string{
+					"-p", "tcp",
+					"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
+					"-j", "REJECT", "--reject-with", "tcp-reset",
+				}})
+			}
+			rules = append(rules, iptRule{"filter", entry.chain, []string{
+				"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
+				"-j", "DROP",
 			}})
 		}
-		rules = append(rules, iptRule{"filter", entry.chain, []string{
-			"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
-			"-j", "DROP",
-		}})
 		rules = append(rules, iptRule{"filter", entry.chain, []string{
 			"-j", "NFQUEUE", "--queue-num", strconv.Itoa(n.queueNum), "--queue-bypass",
 		}})
