@@ -1,6 +1,6 @@
 # ![OpenGFW](docs/logo.png)
 
-[![Quality check status](https://github.com/apernet/OpenGFW/actions/workflows/check.yaml/badge.svg)](https://github.com/apernet/OpenGFW/actions/workflows/check.yaml)
+[![Quality check status](https://github.com/rootmelo92118/OpenGFW/actions/workflows/check.yaml/badge.svg)](https://github.com/rootmelo92118/OpenGFW/actions/workflows/check.yaml)
 [![License][1]][2]
 
 [1]: https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg
