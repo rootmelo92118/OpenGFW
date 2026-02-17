@@ -15,6 +15,7 @@ import (
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/florianl/go-nfqueue"
 	"github.com/mdlayher/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -28,7 +29,68 @@ const (
 	nftDefaultTable = "opengfw"
 )
 
+// EnabledChainsConfig specifies which netfilter chains to attach to.
+// If all fields are false and Local is also false, defaults to Forward=true.
+type EnabledChainsConfig struct {
+	Input   bool
+	Output  bool
+	Forward bool
+}
+
+// activeChains resolves the final list of chains to use.
+// Priority: Docker > EnabledChains explicit > default (Forward only)
+func activeChains(chains EnabledChainsConfig, docker bool) []chainEntry {
+	// Docker mode: intercept both host-level input and container forwarded traffic
+	if docker {
+		return []chainEntry{
+			{chain: "INPUT"},
+			{chain: "FORWARD"},
+		}
+	}
+
+	// Explicit per-chain flags
+	if chains.Input || chains.Output || chains.Forward {
+		var result []chainEntry
+		if chains.Input {
+			result = append(result, chainEntry{chain: "INPUT"})
+		}
+		if chains.Output {
+			result = append(result, chainEntry{chain: "OUTPUT"})
+		}
+		if chains.Forward {
+			result = append(result, chainEntry{chain: "FORWARD"})
+		}
+		return result
+	}
+
+	// Default: Forward only
+	return []chainEntry{
+		{chain: "FORWARD"},
+	}
+}
+
+// chainEntry holds a chain name.
+type chainEntry struct {
+	chain string
+}
+
 func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
+	entries := activeChains(n.enabledChains, n.docker)
+
+	// RST only makes sense when INPUT is present (so we can reject inbound SYNs)
+	if n.rst {
+		inputPresent := false
+		for _, c := range entries {
+			if c.chain == "INPUT" {
+				inputPresent = true
+				break
+			}
+		}
+		if !inputPresent {
+			return nil, errors.New("tcp rst requires INPUT chain to be enabled")
+		}
+	}
+
 	table := &nftTableSpec{
 		Family: nftFamily,
 		Table:  n.table,
@@ -37,82 +99,72 @@ func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", n.connMarkDrop))
 	table.Defines = append(table.Defines, fmt.Sprintf("define QUEUE_NUM=%d", n.queueNum))
 
-	table.Chains = []nftChainSpec{}
-	if n.enabledChains.Input {
-		table.Chains = append(table.Chains, nftChainSpec{
-			Chain:  "INPUT",
-			Header: "type filter hook input priority filter; policy accept;",
-		})
-	}
-	if n.enabledChains.Output {
-		table.Chains = append(table.Chains, nftChainSpec{
-			Chain:  "OUTPUT",
-			Header: "type filter hook output priority filter; policy accept;",
-		})
-	}
-	if n.enabledChains.Forward {
-		table.Chains = append(table.Chains, nftChainSpec{
-			Chain:  "FORWARD",
-			Header: "type filter hook forward priority filter; policy accept;",
-		})
+	chainHeaders := map[string]string{
+		"INPUT":   "type filter hook input priority filter; policy accept;",
+		"OUTPUT":  "type filter hook output priority filter; policy accept;",
+		"FORWARD": "type filter hook forward priority filter; policy accept;",
 	}
 
-	for i := range table.Chains {
-		c := &table.Chains[i]
-
-		if c.Chain == "INPUT" || c.Chain == "OUTPUT" {
-			c.Rules = append(c.Rules, "iif lo accept")
-			c.Rules = append(c.Rules, "oif lo accept")
+	for _, entry := range entries {
+		spec := nftChainSpec{
+			Chain:  entry.chain,
+			Header: chainHeaders[entry.chain],
 		}
-
-		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
-		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
-
-		if c.Chain == "FORWARD" && n.rst {
-			c.Rules = append(c.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
+		spec.Rules = append(spec.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
+		spec.Rules = append(spec.Rules, "ct mark $ACCEPT_CTMARK counter accept")
+		if n.rst {
+			spec.Rules = append(spec.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
 		}
-
-		c.Rules = append(c.Rules, "ct mark $DROP_CTMARK counter drop")
-		c.Rules = append(c.Rules, "counter queue num $QUEUE_NUM bypass")
+		spec.Rules = append(spec.Rules, "ct mark $DROP_CTMARK counter drop")
+		spec.Rules = append(spec.Rules, "counter queue num $QUEUE_NUM bypass")
+		table.Chains = append(table.Chains, spec)
 	}
 
 	return table, nil
 }
 
 func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
-	var chains []string
+	entries := activeChains(n.enabledChains, n.docker)
 
-	if n.enabledChains.Input {
-		chains = append(chains, "INPUT")
-	}
-	if n.enabledChains.Output {
-		chains = append(chains, "OUTPUT")
-	}
-	if n.enabledChains.Forward {
-		chains = append(chains, "FORWARD")
-		if n.docker {
-			chains = append(chains, "DOCKER-USER")
+	if n.rst {
+		inputPresent := false
+		for _, c := range entries {
+			if c.chain == "INPUT" {
+				inputPresent = true
+				break
+			}
+		}
+		if !inputPresent {
+			return nil, errors.New("tcp rst requires INPUT chain to be enabled")
 		}
 	}
 
-	rules := make([]iptRule, 0, 4*len(chains))
-	for _, chain := range chains {
-		if chain == "INPUT" {
-			rules = append(rules, iptRule{"filter", chain, []string{"-i", "lo", "-j", "ACCEPT"}})
-		}
-		if chain == "OUTPUT" {
-			rules = append(rules, iptRule{"filter", chain, []string{"-o", "lo", "-j", "ACCEPT"}})
-		}
+	rules := make([]iptRule, 0, 5*len(entries))
 
-		rules = append(rules, iptRule{"filter", chain, []string{"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept), "-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept)}})
-		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept), "-j", "ACCEPT"}})
-
-		if chain == "FORWARD" && n.rst {
-			rules = append(rules, iptRule{"filter", chain, []string{"-p", "tcp", "-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop), "-j", "REJECT", "--reject-with", "tcp-reset"}})
+	for _, entry := range entries {
+		// Bypass protected connections
+		rules = append(rules, iptRule{"filter", entry.chain, []string{
+			"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept),
+			"-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept),
+		}})
+		rules = append(rules, iptRule{"filter", entry.chain, []string{
+			"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept),
+			"-j", "ACCEPT",
+		}})
+		if n.rst {
+			rules = append(rules, iptRule{"filter", entry.chain, []string{
+				"-p", "tcp",
+				"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
+				"-j", "REJECT", "--reject-with", "tcp-reset",
+			}})
 		}
-
-		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop), "-j", "DROP"}})
-		rules = append(rules, iptRule{"filter", chain, []string{"-j", "NFQUEUE", "--queue-num", strconv.Itoa(n.queueNum), "--queue-bypass"}})
+		rules = append(rules, iptRule{"filter", entry.chain, []string{
+			"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop),
+			"-j", "DROP",
+		}})
+		rules = append(rules, iptRule{"filter", entry.chain, []string{
+			"-j", "NFQUEUE", "--queue-num", strconv.Itoa(n.queueNum), "--queue-bypass",
+		}})
 	}
 
 	return rules, nil
@@ -124,15 +176,15 @@ var errNotNFQueuePacket = errors.New("not an NFQueue packet")
 
 type nfqueuePacketIO struct {
 	n              *nfqueue.Nfqueue
-	local          bool
 	rst            bool
+	docker         bool
+	enabledChains  EnabledChainsConfig
 	rSet           bool // whether the nftables/iptables rules have been set
 	queueNum       int
 	table          string // nftable name
 	connMarkAccept int
 	connMarkDrop   int
-	enabledChains  EnabledChainsConfig
-	docker         bool
+
 	// iptables not nil = use iptables instead of nftables
 	ipt4 *iptables.IPTables
 	ipt6 *iptables.IPTables
@@ -149,17 +201,16 @@ type NFQueuePacketIOConfig struct {
 
 	ReadBuffer  int
 	WriteBuffer int
-	Local       bool
-	RST         bool
-	Docker      bool
 
+	RST bool
+
+	// EnabledChains specifies which netfilter chains to attach to.
+	// If all fields are false and Docker is false, defaults to Forward only.
 	EnabledChains EnabledChainsConfig
-}
 
-type EnabledChainsConfig struct {
-	Input   bool
-	Output  bool
-	Forward bool
+	// Docker mode: intercept INPUT + FORWARD for container traffic.
+	// Cannot be combined with EnabledChains.
+	Docker bool
 }
 
 func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
@@ -187,21 +238,9 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		return nil, errors.New("connMarkAccept and connMarkDrop cannot be the same")
 	}
 
-	if !config.EnabledChains.Input && !config.EnabledChains.Output && !config.EnabledChains.Forward {
-		if config.Local {
-			config.EnabledChains.Input = true
-			config.EnabledChains.Output = true
-		} else {
-			config.EnabledChains.Forward = true
-		}
-	}
-
-	if !config.EnabledChains.Input && !config.EnabledChains.Output && !config.EnabledChains.Forward {
-		return nil, errors.New("at least one chain must be enabled")
-	}
-
-	if config.RST && (config.EnabledChains.Input || config.EnabledChains.Output) {
-		return nil, errors.New("tcp rst is not supported with INPUT/OUTPUT chains")
+	// Validate: Docker and EnabledChains are mutually exclusive
+	if config.Docker && (config.EnabledChains.Input || config.EnabledChains.Output || config.EnabledChains.Forward) {
+		return nil, errors.New("docker mode cannot be combined with enabledChains settings")
 	}
 
 	var ipt4, ipt6 *iptables.IPTables
@@ -243,17 +282,15 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 	}
 	return &nfqueuePacketIO{
 		n:              n,
-		local:          config.Local,
 		rst:            config.RST,
-		rSet:           false,
+		docker:         config.Docker,
+		enabledChains:  config.EnabledChains,
 		queueNum:       int(*config.QueueNum),
 		table:          config.Table,
 		connMarkAccept: int(config.ConnMarkAccept),
 		connMarkDrop:   int(config.ConnMarkDrop),
 		ipt4:           ipt4,
 		ipt6:           ipt6,
-		enabledChains:  config.EnabledChains,
-		docker:         config.Docker,
 		protectedDialer: &net.Dialer{
 			Control: func(network, address string, c syscall.RawConn) error {
 				var err error
@@ -293,7 +330,7 @@ func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error
 		},
 		func(e error) int {
 			if opErr := (*netlink.OpError)(nil); errors.As(e, &opErr) {
-				if opErr.Err != nil && opErr.Err.Error() == "no buffer space available" {
+				if errors.Is(opErr.Err, unix.ENOBUFS) {
 					// Kernel buffer temporarily full, ignore
 					return 0
 				}
@@ -327,8 +364,8 @@ func (n *nfqueuePacketIO) packetAttributeSanityCheck(a nfqueue.Attribute) (ok bo
 		return false, nfqueue.NfDrop
 	}
 	if a.Ct == nil {
-		// Multicast packets may not have a conntrack, but only appear in local mode (INPUT/OUTPUT)
-		if n.enabledChains.Input || n.enabledChains.Output {
+		// Multicast packets may not have a conntrack, but only appear when hooking local input
+		if n.enabledChains.Input || n.docker {
 			return false, nfqueue.NfAccept
 		}
 		return false, nfqueue.NfDrop
@@ -506,16 +543,9 @@ type iptRule struct {
 func iptsBatchAppendUnique(ipts []*iptables.IPTables, rules []iptRule) error {
 	for _, r := range rules {
 		for _, ipt := range ipts {
-			if r.Chain == "DOCKER-USER" {
-				err := ipt.Insert(r.Table, r.Chain, 1, r.RuleSpec...)
-				if err != nil {
-					return err
-				}
-			} else {
-				err := ipt.AppendUnique(r.Table, r.Chain, r.RuleSpec...)
-				if err != nil {
-					return err
-				}
+			err := ipt.AppendUnique(r.Table, r.Chain, r.RuleSpec...)
+			if err != nil {
+				return err
 			}
 		}
 	}
