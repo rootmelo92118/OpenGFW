@@ -11,9 +11,9 @@ import (
 
 const (
 	geoipFilename   = "geoip.dat"
-	geoipURL        = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+	geoipURL        = "https://github.com/rootmelo92118/v2ray-rules-dat/releases/latest/download/geoip.dat"
 	geositeFilename = "geosite.dat"
-	geositeURL      = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+	geositeURL      = "https://github.com/rootmelo92118/v2ray-rules-dat/releases/latest/download/geosite.dat"
 
 	geoDefaultUpdateInterval = 7 * 24 * time.Hour // 7 days
 )
