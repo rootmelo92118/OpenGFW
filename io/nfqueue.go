@@ -200,9 +200,9 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		return nil, errors.New("at least one chain must be enabled")
 	}
 
-	if config.RST && config.EnabledChains.Output {
-    	return nil, errors.New("tcp rst is not supported with OUTPUT chain")
-	}
+	//if config.RST && config.EnabledChains.Output {
+    	//return nil, errors.New("tcp rst is not supported with OUTPUT chain")
+	//}
 
 	var ipt4, ipt6 *iptables.IPTables
 	var err error
