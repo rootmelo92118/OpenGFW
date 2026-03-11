@@ -68,7 +68,7 @@ func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
 		c.Rules = append(c.Rules, "meta mark $ACCEPT_CTMARK ct mark set $ACCEPT_CTMARK") // Bypass protected connections
 		c.Rules = append(c.Rules, "ct mark $ACCEPT_CTMARK counter accept")
 
-		if c.Chain == "FORWARD" && n.rst {
+		if (c.Chain == "FORWARD" || c.Chain == "INPUT") && n.rst {
 			c.Rules = append(c.Rules, "ip protocol tcp ct mark $DROP_CTMARK counter reject with tcp reset")
 		}
 
@@ -107,7 +107,7 @@ func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
 		rules = append(rules, iptRule{"filter", chain, []string{"-m", "mark", "--mark", strconv.Itoa(n.connMarkAccept), "-j", "CONNMARK", "--set-mark", strconv.Itoa(n.connMarkAccept)}})
 		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(n.connMarkAccept), "-j", "ACCEPT"}})
 
-		if chain == "FORWARD" && n.rst {
+		if (chain == "FORWARD" || chain == "INPUT") && n.rst {
 			rules = append(rules, iptRule{"filter", chain, []string{"-p", "tcp", "-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop), "-j", "REJECT", "--reject-with", "tcp-reset"}})
 		}
 
@@ -200,8 +200,8 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 		return nil, errors.New("at least one chain must be enabled")
 	}
 
-	if config.RST && (config.EnabledChains.Input || config.EnabledChains.Output) {
-		return nil, errors.New("tcp rst is not supported with INPUT/OUTPUT chains")
+	if config.RST && config.EnabledChains.Output {
+    	return nil, errors.New("tcp rst is not supported with OUTPUT chain")
 	}
 
 	var ipt4, ipt6 *iptables.IPTables
