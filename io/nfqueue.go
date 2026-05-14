@@ -26,6 +26,17 @@ const (
 
 	nftFamily       = "inet"
 	nftDefaultTable = "opengfw"
+
+	// Each enabled chain gets its own queue number offset from the base:
+	// base+0 = INPUT, base+1 = OUTPUT, base+2 = FORWARD
+	// This lets us identify which chain a packet came from.
+	chainQueueOffsetInput   = 0
+	chainQueueOffsetOutput  = 1
+	chainQueueOffsetForward = 2
+
+	ChainInput   = "input"
+	ChainOutput  = "output"
+	ChainForward = "forward"
 )
 
 func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
@@ -35,25 +46,27 @@ func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
 	}
 	table.Defines = append(table.Defines, fmt.Sprintf("define ACCEPT_CTMARK=%d", n.connMarkAccept))
 	table.Defines = append(table.Defines, fmt.Sprintf("define DROP_CTMARK=%d", n.connMarkDrop))
-	table.Defines = append(table.Defines, fmt.Sprintf("define QUEUE_NUM=%d", n.queueNum))
 
 	table.Chains = []nftChainSpec{}
 	if n.enabledChains.Input {
 		table.Chains = append(table.Chains, nftChainSpec{
-			Chain:  "INPUT",
-			Header: "type filter hook input priority filter; policy accept;",
+			Chain:    "INPUT",
+			Header:   "type filter hook input priority filter; policy accept;",
+			QueueNum: n.queueNum + chainQueueOffsetInput,
 		})
 	}
 	if n.enabledChains.Output {
 		table.Chains = append(table.Chains, nftChainSpec{
-			Chain:  "OUTPUT",
-			Header: "type filter hook output priority filter; policy accept;",
+			Chain:    "OUTPUT",
+			Header:   "type filter hook output priority filter; policy accept;",
+			QueueNum: n.queueNum + chainQueueOffsetOutput,
 		})
 	}
 	if n.enabledChains.Forward {
 		table.Chains = append(table.Chains, nftChainSpec{
-			Chain:  "FORWARD",
-			Header: "type filter hook forward priority filter; policy accept;",
+			Chain:    "FORWARD",
+			Header:   "type filter hook forward priority filter; policy accept;",
+			QueueNum: n.queueNum + chainQueueOffsetForward,
 		})
 	}
 
@@ -73,30 +86,36 @@ func (n *nfqueuePacketIO) generateNftRules() (*nftTableSpec, error) {
 		}
 
 		c.Rules = append(c.Rules, "ct mark $DROP_CTMARK counter drop")
-		c.Rules = append(c.Rules, "counter queue num $QUEUE_NUM bypass")
+		c.Rules = append(c.Rules, fmt.Sprintf("counter queue num %d bypass", c.QueueNum))
 	}
 
 	return table, nil
 }
 
 func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
-	var chains []string
+	type chainEntry struct {
+		name     string
+		queueNum int
+	}
+	var chains []chainEntry
 
 	if n.enabledChains.Input {
-		chains = append(chains, "INPUT")
+		chains = append(chains, chainEntry{"INPUT", n.queueNum + chainQueueOffsetInput})
 	}
 	if n.enabledChains.Output {
-		chains = append(chains, "OUTPUT")
+		chains = append(chains, chainEntry{"OUTPUT", n.queueNum + chainQueueOffsetOutput})
 	}
 	if n.enabledChains.Forward {
-		chains = append(chains, "FORWARD")
+		chains = append(chains, chainEntry{"FORWARD", n.queueNum + chainQueueOffsetForward})
 		if n.docker {
-			chains = append(chains, "DOCKER-USER")
+			chains = append(chains, chainEntry{"DOCKER-USER", n.queueNum + chainQueueOffsetForward})
 		}
 	}
 
 	rules := make([]iptRule, 0, 4*len(chains))
-	for _, chain := range chains {
+	for _, ce := range chains {
+		chain := ce.name
+		qNum := ce.queueNum
 		if chain == "INPUT" {
 			rules = append(rules, iptRule{"filter", chain, []string{"-i", "lo", "-j", "ACCEPT"}})
 		}
@@ -112,7 +131,7 @@ func (n *nfqueuePacketIO) generateIptRules() ([]iptRule, error) {
 		}
 
 		rules = append(rules, iptRule{"filter", chain, []string{"-m", "connmark", "--mark", strconv.Itoa(n.connMarkDrop), "-j", "DROP"}})
-		rules = append(rules, iptRule{"filter", chain, []string{"-j", "NFQUEUE", "--queue-num", strconv.Itoa(n.queueNum), "--queue-bypass"}})
+		rules = append(rules, iptRule{"filter", chain, []string{"-j", "NFQUEUE", "--queue-num", strconv.Itoa(qNum), "--queue-bypass"}})
 	}
 
 	return rules, nil
@@ -123,7 +142,9 @@ var _ PacketIO = (*nfqueuePacketIO)(nil)
 var errNotNFQueuePacket = errors.New("not an NFQueue packet")
 
 type nfqueuePacketIO struct {
-	n              *nfqueue.Nfqueue
+	// nQueues holds one nfqueue instance per enabled chain.
+	// index 0=INPUT, 1=OUTPUT, 2=FORWARD (only enabled ones are non-nil)
+	nQueues        [3]*nfqueue.Nfqueue
 	local          bool
 	rst            bool
 	rSet           bool // whether the nftables/iptables rules have been set
@@ -217,32 +238,64 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 			return nil, err
 		}
 	}
-	n, err := nfqueue.Open(&nfqueue.Config{
-		NfQueue:      *config.QueueNum,
-		MaxPacketLen: nfqueueMaxPacketLen,
-		MaxQueueLen:  config.QueueSize,
-		Copymode:     nfqueue.NfQnlCopyPacket,
-		Flags:        nfqueue.NfQaCfgFlagConntrack,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if config.ReadBuffer > 0 {
-		err = n.Con.SetReadBuffer(config.ReadBuffer)
+
+	// Open one nfqueue per enabled chain, each with its own queue number.
+	openNFQueue := func(offset int) (*nfqueue.Nfqueue, error) {
+		n, err := nfqueue.Open(&nfqueue.Config{
+			NfQueue:      uint16(int(*config.QueueNum) + offset),
+			MaxPacketLen: nfqueueMaxPacketLen,
+			MaxQueueLen:  config.QueueSize,
+			Copymode:     nfqueue.NfQnlCopyPacket,
+			Flags:        nfqueue.NfQaCfgFlagConntrack,
+		})
 		if err != nil {
-			_ = n.Close()
+			return nil, err
+		}
+		if config.ReadBuffer > 0 {
+			if err = n.Con.SetReadBuffer(config.ReadBuffer); err != nil {
+				_ = n.Close()
+				return nil, err
+			}
+		}
+		if config.WriteBuffer > 0 {
+			if err = n.Con.SetWriteBuffer(config.WriteBuffer); err != nil {
+				_ = n.Close()
+				return nil, err
+			}
+		}
+		return n, nil
+	}
+
+	var nQueues [3]*nfqueue.Nfqueue
+	if config.EnabledChains.Input {
+		nQueues[chainQueueOffsetInput], err = openNFQueue(chainQueueOffsetInput)
+		if err != nil {
 			return nil, err
 		}
 	}
-	if config.WriteBuffer > 0 {
-		err = n.Con.SetWriteBuffer(config.WriteBuffer)
+	if config.EnabledChains.Output {
+		nQueues[chainQueueOffsetOutput], err = openNFQueue(chainQueueOffsetOutput)
 		if err != nil {
-			_ = n.Close()
+			if nQueues[chainQueueOffsetInput] != nil {
+				_ = nQueues[chainQueueOffsetInput].Close()
+			}
 			return nil, err
 		}
 	}
+	if config.EnabledChains.Forward {
+		nQueues[chainQueueOffsetForward], err = openNFQueue(chainQueueOffsetForward)
+		if err != nil {
+			for _, nq := range nQueues {
+				if nq != nil {
+					_ = nq.Close()
+				}
+			}
+			return nil, err
+		}
+	}
+
 	return &nfqueuePacketIO{
-		n:              n,
+		nQueues:        nQueues,
 		local:          config.Local,
 		rst:            config.RST,
 		rSet:           false,
@@ -270,40 +323,58 @@ func NewNFQueuePacketIO(config NFQueuePacketIOConfig) (PacketIO, error) {
 }
 
 func (n *nfqueuePacketIO) Register(ctx context.Context, cb PacketCallback) error {
-	err := n.n.RegisterWithErrorFunc(ctx,
-		func(a nfqueue.Attribute) int {
-			if ok, verdict := n.packetAttributeSanityCheck(a); !ok {
-				if a.PacketID != nil {
-					_ = n.n.SetVerdict(*a.PacketID, verdict)
-				}
-				return 0
-			}
-			p := &nfqueuePacket{
-				id:       *a.PacketID,
-				streamID: ctIDFromCtBytes(*a.Ct),
-				data:     *a.Payload,
-			}
-			// Use timestamp from attribute if available, otherwise use current time as fallback
-			if a.Timestamp != nil {
-				p.timestamp = *a.Timestamp
-			} else {
-				p.timestamp = time.Now()
-			}
-			return okBoolToInt(cb(p, nil))
-		},
-		func(e error) int {
-			if opErr := (*netlink.OpError)(nil); errors.As(e, &opErr) {
-				if opErr.Err != nil && opErr.Err.Error() == "no buffer space available" {
-					// Kernel buffer temporarily full, ignore
+	// Helper to register one queue with its chain label.
+	register := func(nq *nfqueue.Nfqueue, chainName string) error {
+		return nq.RegisterWithErrorFunc(ctx,
+			func(a nfqueue.Attribute) int {
+				if ok, verdict := n.packetAttributeSanityCheck(a); !ok {
+					if a.PacketID != nil {
+						_ = nq.SetVerdict(*a.PacketID, verdict)
+					}
 					return 0
 				}
-			}
-			return okBoolToInt(cb(nil, e))
-		})
-	if err != nil {
-		return err
+				p := &nfqueuePacket{
+					nq:       nq,
+					id:       *a.PacketID,
+					streamID: ctIDFromCtBytes(*a.Ct),
+					data:     *a.Payload,
+					chain:    chainName,
+				}
+				if a.Timestamp != nil {
+					p.timestamp = *a.Timestamp
+				} else {
+					p.timestamp = time.Now()
+				}
+				return okBoolToInt(cb(p, nil))
+			},
+			func(e error) int {
+				if opErr := (*netlink.OpError)(nil); errors.As(e, &opErr) {
+					if opErr.Err != nil && opErr.Err.Error() == "no buffer space available" {
+						return 0
+					}
+				}
+				return okBoolToInt(cb(nil, e))
+			})
 	}
+
+	if n.enabledChains.Input {
+		if err := register(n.nQueues[chainQueueOffsetInput], ChainInput); err != nil {
+			return err
+		}
+	}
+	if n.enabledChains.Output {
+		if err := register(n.nQueues[chainQueueOffsetOutput], ChainOutput); err != nil {
+			return err
+		}
+	}
+	if n.enabledChains.Forward {
+		if err := register(n.nQueues[chainQueueOffsetForward], ChainForward); err != nil {
+			return err
+		}
+	}
+
 	if !n.rSet {
+		var err error
 		if n.ipt4 != nil {
 			err = n.setupIpt(false)
 		} else {
@@ -341,19 +412,19 @@ func (n *nfqueuePacketIO) SetVerdict(p Packet, v Verdict, newPacket []byte) erro
 	if !ok {
 		return &ErrInvalidPacket{Err: errNotNFQueuePacket}
 	}
+	nq := nP.nq
 	switch v {
 	case VerdictAccept:
-		return n.n.SetVerdict(nP.id, nfqueue.NfAccept)
+		return nq.SetVerdict(nP.id, nfqueue.NfAccept)
 	case VerdictAcceptModify:
-		return n.n.SetVerdictModPacket(nP.id, nfqueue.NfAccept, newPacket)
+		return nq.SetVerdictModPacket(nP.id, nfqueue.NfAccept, newPacket)
 	case VerdictAcceptStream:
-		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfAccept, n.connMarkAccept)
+		return nq.SetVerdictWithConnMark(nP.id, nfqueue.NfAccept, n.connMarkAccept)
 	case VerdictDrop:
-		return n.n.SetVerdict(nP.id, nfqueue.NfDrop)
+		return nq.SetVerdict(nP.id, nfqueue.NfDrop)
 	case VerdictDropStream:
-		return n.n.SetVerdictWithConnMark(nP.id, nfqueue.NfDrop, n.connMarkDrop)
+		return nq.SetVerdictWithConnMark(nP.id, nfqueue.NfDrop, n.connMarkDrop)
 	default:
-		// Invalid verdict, ignore for now
 		return nil
 	}
 }
@@ -371,7 +442,15 @@ func (n *nfqueuePacketIO) Close() error {
 		}
 		n.rSet = false
 	}
-	return n.n.Close()
+	var firstErr error
+	for _, nq := range n.nQueues {
+		if nq != nil {
+			if err := nq.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // nfqueue IO does not issue shutdown
@@ -417,10 +496,12 @@ func (n *nfqueuePacketIO) setupIpt(remove bool) error {
 var _ Packet = (*nfqueuePacket)(nil)
 
 type nfqueuePacket struct {
+	nq        *nfqueue.Nfqueue // the queue this packet came from
 	id        uint32
 	streamID  uint32
 	timestamp time.Time
 	data      []byte
+	chain     string // "input", "output", or "forward"
 }
 
 func (p *nfqueuePacket) StreamID() uint32 {
@@ -433,6 +514,10 @@ func (p *nfqueuePacket) Timestamp() time.Time {
 
 func (p *nfqueuePacket) Data() []byte {
 	return p.data
+}
+
+func (p *nfqueuePacket) Chain() string {
+	return p.chain
 }
 
 func okBoolToInt(ok bool) int {
@@ -484,9 +569,10 @@ table %s %s {
 }
 
 type nftChainSpec struct {
-	Chain  string
-	Header string
-	Rules  []string
+	Chain    string
+	Header   string
+	QueueNum int
+	Rules    []string
 }
 
 func (c *nftChainSpec) String() string {

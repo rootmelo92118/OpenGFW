@@ -26,6 +26,7 @@ const (
 type workerPacket struct {
 	StreamID   uint32
 	Packet     gopacket.Packet
+	Chain      string
 	SetVerdict func(io.Verdict, []byte) error
 }
 
@@ -134,7 +135,7 @@ func (w *worker) Run(ctx context.Context) {
 				// Closed
 				return
 			}
-			v, b := w.handle(wPkt.StreamID, wPkt.Packet)
+			v, b := w.handle(wPkt.StreamID, wPkt.Chain, wPkt.Packet)
 			_ = wPkt.SetVerdict(v, b)
 		case <-tcpFlushTicker.C:
 			w.flushTCP(w.tcpTimeout)
@@ -149,7 +150,7 @@ func (w *worker) UpdateRuleset(r ruleset.Ruleset) error {
 	return w.udpStreamFactory.UpdateRuleset(r)
 }
 
-func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte) {
+func (w *worker) handle(streamID uint32, chain string, p gopacket.Packet) (io.Verdict, []byte) {
 	netLayer, trLayer := p.NetworkLayer(), p.TransportLayer()
 	if netLayer == nil || trLayer == nil {
 		// Invalid packet
@@ -158,9 +159,9 @@ func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte)
 	ipFlow := netLayer.NetworkFlow()
 	switch tr := trLayer.(type) {
 	case *layers.TCP:
-		return w.handleTCP(ipFlow, p.Metadata(), tr), nil
+		return w.handleTCP(ipFlow, chain, p.Metadata(), tr), nil
 	case *layers.UDP:
-		v, modPayload := w.handleUDP(streamID, ipFlow, tr)
+		v, modPayload := w.handleUDP(streamID, ipFlow, chain, tr)
 		if v == io.VerdictAcceptModify && modPayload != nil {
 			tr.Payload = modPayload
 			_ = tr.SetNetworkLayerForChecksum(netLayer)
@@ -171,22 +172,21 @@ func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte)
 					ComputeChecksums: true,
 				}, p)
 			if err != nil {
-				// Just accept without modification for now
 				return io.VerdictAccept, nil
 			}
 			return v, w.modSerializeBuffer.Bytes()
 		}
 		return v, nil
 	default:
-		// Unsupported protocol
 		return io.VerdictAccept, nil
 	}
 }
 
-func (w *worker) handleTCP(ipFlow gopacket.Flow, pMeta *gopacket.PacketMetadata, tcp *layers.TCP) io.Verdict {
+func (w *worker) handleTCP(ipFlow gopacket.Flow, chain string, pMeta *gopacket.PacketMetadata, tcp *layers.TCP) io.Verdict {
 	ctx := &tcpContext{
 		PacketMetadata: pMeta,
 		Verdict:        tcpVerdictAccept,
+		Chain:          chain,
 	}
 	w.tcpAssembler.AssembleWithContext(ipFlow, tcp, ctx)
 	return io.Verdict(ctx.Verdict)
@@ -197,10 +197,10 @@ func (w *worker) flushTCP(timeout time.Duration) {
 	w.logger.TCPFlush(w.id, flushed, closed)
 }
 
-func (w *worker) handleUDP(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP) (io.Verdict, []byte) {
+func (w *worker) handleUDP(streamID uint32, ipFlow gopacket.Flow, chain string, udp *layers.UDP) (io.Verdict, []byte) {
 	ctx := &udpContext{
 		Verdict: udpVerdictAccept,
 	}
-	w.udpStreamManager.MatchWithContext(streamID, ipFlow, udp, ctx)
+	w.udpStreamManager.MatchWithContext(streamID, ipFlow, chain, udp, ctx)
 	return io.Verdict(ctx.Verdict), ctx.Packet
 }

@@ -29,6 +29,8 @@ type Packet interface {
 	Timestamp() time.Time
 	// Data is the raw packet data, starting with the IP header.
 	Data() []byte
+	// Chain is the netfilter chain the packet arrived from ("input", "output", "forward").
+	Chain() string
 }
 
 // PacketCallback is called for each packet received.

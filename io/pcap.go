@@ -134,3 +134,8 @@ func (p *pcapPacket) Timestamp() time.Time {
 func (p *pcapPacket) Data() []byte {
 	return p.data
 }
+
+// Chain returns empty string for pcap replay (no chain context).
+func (p *pcapPacket) Chain() string {
+	return ""
+}

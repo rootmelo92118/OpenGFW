@@ -198,6 +198,7 @@ func streamInfoToExprEnv(info StreamInfo) map[string]interface{} {
 			"src": info.SrcPort,
 			"dst": info.DstPort,
 		},
+		"chain": info.Chain,
 	}
 	for anName, anProps := range info.Props {
 		if len(anProps) != 0 {
@@ -210,7 +211,7 @@ func streamInfoToExprEnv(info StreamInfo) map[string]interface{} {
 
 func isBuiltInAnalyzer(name string) bool {
 	switch name {
-	case "id", "proto", "ip", "port":
+	case "id", "proto", "ip", "port", "chain":
 		return true
 	default:
 		return false

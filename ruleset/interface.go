@@ -71,6 +71,7 @@ type StreamInfo struct {
 	SrcIP, DstIP     net.IP
 	SrcPort, DstPort uint16
 	Props            analyzer.CombinedPropMap
+	Chain            string // "input", "output", "forward", or "" for pcap replay
 }
 
 func (i StreamInfo) SrcString() string {
