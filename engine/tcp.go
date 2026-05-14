@@ -28,6 +28,7 @@ const (
 type tcpContext struct {
 	*gopacket.PacketMetadata
 	Verdict tcpVerdict
+	Chain   string
 }
 
 func (ctx *tcpContext) GetCaptureInfo() gopacket.CaptureInfo {
@@ -46,6 +47,10 @@ type tcpStreamFactory struct {
 func (f *tcpStreamFactory) New(ipFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, ac reassembly.AssemblerContext) reassembly.Stream {
 	id := f.Node.Generate()
 	ipSrc, ipDst := net.IP(ipFlow.Src().Raw()), net.IP(ipFlow.Dst().Raw())
+	chain := ""
+	if ctx, ok := ac.(*tcpContext); ok {
+		chain = ctx.Chain
+	}
 	info := ruleset.StreamInfo{
 		ID:       id.Int64(),
 		Protocol: ruleset.ProtocolTCP,
@@ -54,6 +59,7 @@ func (f *tcpStreamFactory) New(ipFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, a
 		SrcPort:  uint16(tcp.SrcPort),
 		DstPort:  uint16(tcp.DstPort),
 		Props:    make(analyzer.CombinedPropMap),
+		Chain:    chain,
 	}
 	f.Logger.TCPStreamNew(f.WorkerID, info)
 	f.RulesetMutex.RLock()

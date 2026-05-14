@@ -117,6 +117,7 @@ func (e *engine) dispatch(p io.Packet) bool {
 	e.workers[index].Feed(&workerPacket{
 		StreamID: p.StreamID(),
 		Packet:   packet,
+		Chain:    p.Chain(),
 		SetVerdict: func(v io.Verdict, b []byte) error {
 			return e.io.SetVerdict(p, v, b)
 		},

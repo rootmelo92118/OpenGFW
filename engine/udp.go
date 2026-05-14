@@ -44,7 +44,7 @@ type udpStreamFactory struct {
 	Ruleset      ruleset.Ruleset
 }
 
-func (f *udpStreamFactory) New(ipFlow, udpFlow gopacket.Flow, udp *layers.UDP, uc *udpContext) *udpStream {
+func (f *udpStreamFactory) New(ipFlow, udpFlow gopacket.Flow, udp *layers.UDP, chain string, uc *udpContext) *udpStream {
 	id := f.Node.Generate()
 	ipSrc, ipDst := net.IP(ipFlow.Src().Raw()), net.IP(ipFlow.Dst().Raw())
 	info := ruleset.StreamInfo{
@@ -55,6 +55,7 @@ func (f *udpStreamFactory) New(ipFlow, udpFlow gopacket.Flow, udp *layers.UDP, u
 		SrcPort:  uint16(udp.SrcPort),
 		DstPort:  uint16(udp.DstPort),
 		Props:    make(analyzer.CombinedPropMap),
+		Chain:    chain,
 	}
 	f.Logger.UDPStreamNew(f.WorkerID, info)
 	f.RulesetMutex.RLock()
@@ -124,13 +125,13 @@ func newUDPStreamManager(factory *udpStreamFactory, maxStreams int) (*udpStreamM
 	}, nil
 }
 
-func (m *udpStreamManager) MatchWithContext(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP, uc *udpContext) {
+func (m *udpStreamManager) MatchWithContext(streamID uint32, ipFlow gopacket.Flow, chain string, udp *layers.UDP, uc *udpContext) {
 	rev := false
 	value, ok := m.streams.Get(streamID)
 	if !ok {
 		// New stream
 		value = &udpStreamValue{
-			Stream:  m.factory.New(ipFlow, udp.TransportFlow(), udp, uc),
+			Stream:  m.factory.New(ipFlow, udp.TransportFlow(), udp, chain, uc),
 			IPFlow:  ipFlow,
 			UDPFlow: udp.TransportFlow(),
 		}
@@ -142,7 +143,7 @@ func (m *udpStreamManager) MatchWithContext(streamID uint32, ipFlow gopacket.Flo
 			// It's not - close the old stream & replace it with a new one
 			value.Stream.Close()
 			value = &udpStreamValue{
-				Stream:  m.factory.New(ipFlow, udp.TransportFlow(), udp, uc),
+				Stream:  m.factory.New(ipFlow, udp.TransportFlow(), udp, chain, uc),
 				IPFlow:  ipFlow,
 				UDPFlow: udp.TransportFlow(),
 			}
